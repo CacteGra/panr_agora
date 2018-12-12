@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+
+set -o nounset
+
+
+BLUETOOTH_NAME="panr"
+BRIDGE_NAME="br0"
+BRIDGE_IP=""
+BRIDGE_DHCP="true"
+MAC_FILTER="[0-9A-F:]\{17\}"
+
+while [[ $# > 0 ]]; do
+	KEY="$1"
+	case ${KEY} in
+		-bn|--bluetooth-name)
+			BLUETOOTH_NAME=${2:-${BLUETOOTH_NAME}}
+			shift
+			;;
+		-ip)
+			BRIDGE_IP=${2:-${BRIDGE_IP}}
+			shift
+			;;
+		-mf|--mac-filter)
+			MAC_FILTER=${2:-${MAC_FILTER}}
+			shift
+			;;
+		-nd|--no-dhcp)
+			BRIDGE_DHCP="false"
+			;;
+		*)
+			break
+			;;
+	esac
+	shift
+done
+
+
+
+# List all bridges
+function bridge_list() {
+	brctl show | tail --lines +2 | grep "^\w" | awk '{print $1}' | sort
+}
+
+# List all interfaces on a bridge
+function bridge_interfaces() {
+	OUTPUT=$(brctl show "$1" | tail --lines +2)
+	if [ "$(echo "${OUTPUT}" | head -1 | awk '{print NF}')" -ge "4" ]; then
+		echo "${OUTPUT}" | awk '{print $NF}'
+	fi
+}
+
+# List all interfaces on all bridges
+function bridges_interfaces() {
+	sort <(for BRIDGE in $(bridge_list); do
+		bridge_interfaces "${BRIDGE}"
+	done)
+}
+
+# Create a bridge
+function bridge_create() {
+	sudo brctl addbr "$1"
+	sudo brctl setfd "$1" 0
+	sudo brctl stp "$1" off
+	BRIDGE_IP="10.0.0.0"
+	sudo ifconfig "$1" $(ipcalc_hostmin "${BRIDGE_IP}") netmask $(ipcalc_netmask "${BRIDGE_IP}") up
+}
+
+# Delete a bridge
+function bridge_delete() {
+	sudo ifconfig "$1" down
+	sudo brctl delbr "$1"
+}
+
+
+# Get the IPv4 address (including netmask) of an interface
+function ip_inet() {
+	ip addr show "$1" | grep "inet" | grep --invert-match "inet6" | awk '{print $2}'
+}
+
+# Get all IPv4 addresses (including netmask) from all interfaces
+function ip_inets() {
+	for IP in $(ip addr show | grep "inet" | grep --invert-match "inet6" | awk '{print $2}'); do
+		ipcalc_address "${IP}"
+	done
+}
+
+# Calculate the next unused 192.168.x.x IPv4 address range
+function ip_inet_next() {
+	OCTET=$(sort <(for IP in  $(ip_inets | grep "192.168.[0-9]\+"); do
+		ipcalc_network_prefix "${IP}"
+	done) | tail -1 | cut --delimiter "." --fields 3)
+	OCTET=$(expr ${OCTET} + 1)
+	echo "192.168.${OCTET}.0"
+}
+
+
+# Calculate the address (excluding netmask) from an address
+function ipcalc_address() {
+	ipcalc "$1" | grep Address | awk '{print $2}'
+}
+
+# Calculate the network/gateway from an address
+function ipcalc_network() {
+	ipcalc "$1" | grep Network | awk '{print $2}'
+}
+
+# Calculate the network/gateway prefix (remove all 0 octets) from an address
+function ipcalc_network_prefix() {
+	ipcalc_network "$1" | sed 's/\.0\/[0-9]\+//'
+}
+
+# Calculate the netmask from an address
+function ipcalc_netmask() {
+	ipcalc "$1" | grep Netmask | awk '{print $2}'
+}
+
+# Calculate the first valid address in subnet from an address
+function ipcalc_hostmin() {
+	ipcalc "$1" | grep HostMin | awk '{print $2}'
+}
+
+# Calculate the last valid address in subnet from an address
+function ipcalc_hostmax() {
+	ipcalc "$1" | grep HostMax | awk '{print $2}'
+}
+
+
+# List all network interfaces
+function interface_list() {
+	comm -23 <(ifconfig | grep "^\w" | grep -e "${MAC_FILTER}" | awk '{print $1}' | sed 's/://' | grep --invert-match '^lo$' | sort) <(bridge_list)
+}
+
+# List all wired (non-wireless) network interfaces
+function interface_wired() {
+	comm -23 <(interface_list) <(interface_wireless)
+}
+
+# List all wireless network interfaces
+function interface_wireless() {
+	iwconfig 2> /dev/null | grep "^\w" | awk '{print $1}' | sort
+}
+
+# Get the IPv4 address (excluding netmask) of an interface
+function interface_ip() {
+	ipcalc_address $(ip_inet "$1")
+}
+
+# List all network interfaces with IP addresses
+function interface_connected() {
+	for INTERFACE in $(interface_list); do
+		if [ "$(ip_inet "${INTERFACE}")" != "" ]; then
+			echo "${INTERFACE}"
+		fi
+	done
+}
+
+
+# List all HCI (Bluetooth) interfaces
+function hci_list() {
+	hciconfig | grep --after-context 1 "^\w" | sed '$!N;$!N;s/\n/ /g' | grep -e "${MAC_FILTER}" | awk '{print $1}' | sed 's/://' | sort
+}
+
+# Get the MAC of an HCI interface
+function hci_mac() {
+	hcitool dev | grep "$1" | awk '{print $2}'
+}
+
+# Add an HCI interface to the bridge
+function hci_bridge() {
+	echo "   Killing existing PAN listeners ..."
+	kill_args "python.*bt-pan.*$1"
+	echo "   Configuring $1 for PAN ..."
+	sudo hciconfig "$1" up
+	sudo hciconfig "$1" reset
+	sudo hciconfig "$1" name "${BLUETOOTH_NAME}-$1"
+	sudo hciconfig "$1" class 0x20108
+	sudo hciconfig "$1" lm MASTER,ACCEPT
+	sudo hciconfig "$1" piscan
+	echo "   Starting PAN listener ..."
+	/home/pi/bt-pan --device "$1" server "${BRIDGE_NAME}" &
+}
+
+# Set an HCI interface into PAN mode
+function hci_pans() {
+	ps -Afw | grep "bt-pan" | grep --invert-match "grep" | sed 's/^\([^ ]\+[ ]\+\)\{7\}//' | sed -n "s/.*\(-i\|--device\) \([^ ]\+\).*/\2/p" | sort
+}
+
+# Start a DHCP server on an interface
+function dhcp_start() {
+	INET_IP=$(interface_ip "$1")
+	CONF=$(mktemp)
+	if [ "$2" != "false" ] && [ "$2" != "${CONF}" ]; then
+		cat "$2" > "${CONF}"
+	fi
+	if [ "$(which udhcpd)" != "" ]; then
+		echo "interface   $1" >> "${CONF}"
+		echo "start       $(ipcalc_network_prefix "${INET_IP}").100" >> "${CONF}"
+		echo "end         $(ipcalc_hostmax "${INET_IP}")" >> "${CONF}"
+		echo "opt dns     8.8.8.8 8.8.4.4" >> "${CONF}"
+		echo "opt router  $(ipcalc_hostmin "${INET_IP}")" >> "${CONF}"
+		echo "opt subnet  $(ipcalc_netmask "${INET_IP}")" >> "${CONF}"
+		echo "opt lease   86400" >> "${CONF}"
+		sudo udhcpd "${CONF}"
+		if [ "$2" == "false" ]; then
+			echo "${CONF}"
+		fi
+	fi
+}
+
+
+# Kill a command with the given arguments
+function kill_args() {
+	for PID in $(ps -Afw | grep "$1" | grep --invert-match "grep" | awk '{print $2}'); do
+		sudo kill ${PID} &> /dev/null || true
+		if [ -e "/proc/${PID}" ]; then
+			sudo kill -KILL ${PID} &> /dev/null || true
+		fi
+	done
+}
+
+
+# List all interfaces eligible to be bridged
+# (Exclude wireless interfaces because they have to be forwarded rather than bridged)
+# (If starting DHCP, exclude interfaces with IP/DHCP so new DHCP requests don't get forwarded)
+function interfaces() {
+	ELIGIBLE=$(sort <(interface_wired) <(comm -23 <(hci_list) <(hci_pans)))
+	if [ "${BRIDGE_DHCP}" == "true" ]; then
+		ELIGIBLE=$(comm -23 <(echo "${ELIGIBLE}") <(interface_connected))
+	fi
+	echo "${ELIGIBLE}"
+}
+
+
+
+# Cleanup
+kill_args "python.*bt-pan"
+sudo killall udhcpd &> /dev/null || true
+
+# Set up master bridge
+for BRIDGE in $(bridge_list); do
+	echo "Removing bridge ${BRIDGE} ($(interface_ip "${BRIDGE}")) ..."
+	bridge_delete "${BRIDGE}"
+done
+echo "Creating bridge ${BRIDGE_NAME} ..."
+bridge_create "${BRIDGE_NAME}"
+echo "   $(interface_ip "${BRIDGE_NAME}")"
+echo ""
+
+# Start DHCP server
+if [ "${BRIDGE_DHCP}" == "true" ]; then
+	echo "Starting DHCP server on ${BRIDGE_NAME} ..."
+	TEMP_FILE=$(dhcp_start "${BRIDGE_NAME}" "false")
+	echo ""
+fi
+
+# Main loop
+was_connected="true"
+already_connected="false"
+hotspot="false"
+PREVIOUS_INTERFACE=""
+sudo cp /dev/null /home/pier/agora/oikos/hotspot/hostapd.conf
+while true; do
+	THE_INTERFACE=$(sed -n 's/interface=//p' '/home/pier/agora/oikos/hotspot/hostapd.conf')
+	echo "${TEMP_FILE}"
+	echo "${THE_INTERFACE}"
+	if [ "${THE_INTERFACE}" ] && [ "${hotspot}" == "false" ] && [[ $(iwconfig "${THE_INTERFACE}") = *"Master"* ]]; then
+		PREVIOUS_INTERFACE="${THE_INTERFACE}"
+		BRIDGE_IP=$(ip_inet_next)
+		echo "${BRIDGE_IP}"
+		sudo ifconfig "${THE_INTERFACE}" $(ipcalc_hostmin "${BRIDGE_IP}") netmask $(ipcalc_netmask "${BRIDGE_IP}") up
+		echo "Starting DHCP server on ${THE_INTERFACE} ..."
+		dhcp_start "${THE_INTERFACE}" "${TEMP_FILE}"
+		echo ""
+		hotspot="true"
+		hotspot_on="true"
+	elif [ "${hotspot}" == "false" ] && [ -z "${THE_INTERFACE}" ]; then
+		echo ""
+	elif [ ${PREVIOUS_INTERFACE} ] && [ -z "${THE_INTERFACE}" ]; then
+		sudo udhcpd "${TEMP_FILE}"
+		sudo ifconfig "${PREVIOUS_INTERFACE}" down
+		hotspot="false"
+		hotspot_on="false"
+	fi
+	wget -q --tries=3 --timeout=3 --spider http://google.com
+	if [[ $? -eq 0 ]]; then
+	was_connected="false"
+	echo "connected"
+	if [ "${already_connected}" == "false" ]; then
+	already_connected="true"
+	sysctl net.ipv4.ip_forward=1
+	iptables -F
+	iptables -t nat -F
+	iptables -t mangle -F
+	INT=$(/sbin/ip route | awk '/default/ { print $5 }')
+	for available_interface in ${INT}; do
+		iptables -t nat -A POSTROUTING -o ${available_interface} -j MASQUERADE
+		break
+	done
+	fi
+	else
+	echo "not connected removing iptables"
+	if [ "${was_connected}" == "true" ]; then
+	iptables -F
+	iptables -t nat -F
+	iptables -t mangle -F
+	INT=$(/sbin/ip route | awk '/default/ { print $5 }')
+	for available_interface in ${INT}; do
+		iptables -t nat -A POSTROUTING -o ${available_interface} -j MASQUERADE
+		break
+	done
+	was_connected="false"
+	already_connected="false"
+	fi
+	fi
+
+	# Un-bridge interfaces that no longer exist
+	for INTERFACE in $(comm -23 <(bridges_interfaces) <(interfaces) | grep --invert-match '^bnep'); do
+		echo "Un-bridging ${INTERFACE} ..."
+		sudo brctl delif "${BRIDGE_NAME}" "${INTERFACE}"
+		echo ""
+	done
+
+	# Bridge new interfaces
+	for INTERFACE in $(comm -23 <(interfaces) <(bridges_interfaces)); do
+		echo "Bridging ${INTERFACE} ..."
+		INTERFACE_TYPE=$(echo "${INTERFACE}" | sed 's/[0-9]//')
+		declare -f -F "${INTERFACE_TYPE}_bridge" > /dev/null && (
+			eval "${INTERFACE_TYPE}_bridge" "${INTERFACE}"
+		) || (
+			sudo ifconfig "${INTERFACE}" up
+			sudo brctl addif "${BRIDGE_NAME}" "${INTERFACE}"
+		)
+		echo ""
+	done
+	sleep 1s
+done
