@@ -1,0 +1,3 @@
+[submodule "bt-pan"]
+	path = bt-pan
+	url = https://github.com/CacteGra/bt-pan.git
