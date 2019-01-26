@@ -177,7 +177,7 @@ function hci_bridge() {
 	sudo hciconfig "$1" lm MASTER,ACCEPT
 	sudo hciconfig "$1" piscan
 	echo "   Starting PAN listener ..."
-	/home/pi/bt-pan --device "$1" server "${BRIDGE_NAME}" &
+	$PWD/bt-pan/bt-pan --device "$1" server "${BRIDGE_NAME}" &
 }
 
 # Set an HCI interface into PAN mode
@@ -258,9 +258,9 @@ was_connected="true"
 already_connected="false"
 hotspot="false"
 PREVIOUS_INTERFACE=""
-sudo cp /dev/null /home/pier/agora/oikos/hotspot/hostapd.conf
+sudo cp /dev/null ../../hotspot/hostapd.conf
 while true; do
-	THE_INTERFACE=$(sed -n 's/interface=//p' '/home/pier/agora/oikos/hotspot/hostapd.conf')
+	THE_INTERFACE=$(sed -n 's/interface=//p' '../../hotspot/hostapd.conf')
 	echo "${TEMP_FILE}"
 	echo "${THE_INTERFACE}"
 	if [ "${THE_INTERFACE}" ] && [ "${hotspot}" == "false" ] && [[ $(iwconfig "${THE_INTERFACE}") = *"Master"* ]]; then
@@ -334,3 +334,4 @@ while true; do
 	done
 	sleep 1s
 done
+
