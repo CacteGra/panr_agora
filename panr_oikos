@@ -286,16 +286,18 @@ while true; do
 	was_connected="false"
 	echo "connected"
 	if [ "${already_connected}" == "false" ]; then
-	already_connected="true"
+	INT=$(/sbin/ip route | awk '/default/ { print $5 }')
+	if [ -n "$INT" ]; then
 	sysctl net.ipv4.ip_forward=1
 	iptables -F
 	iptables -t nat -F
 	iptables -t mangle -F
-	INT=$(/sbin/ip route | awk '/default/ { print $5 }')
 	for available_interface in ${INT}; do
 		iptables -t nat -A POSTROUTING -o ${available_interface} -j MASQUERADE
+		already_connected="true"
 		break
 	done
+	fi
 	fi
 	else
 	echo "not connected removing iptables"
